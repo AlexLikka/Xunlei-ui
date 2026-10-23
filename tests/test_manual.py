@@ -18,7 +18,7 @@ class ManualTests(unittest.TestCase):
             self.assertFalse(candidate(t))
 
     def test_preview_and_single_use(self):
-        with tempfile.TemporaryDirectory() as d,patch('monitor.ROOT',Path(d)):
+        with tempfile.TemporaryDirectory() as d,patch('monitor.DATA',Path(d)):
             m=Monitor(dict(poll_seconds=15,idle_seconds=600,mode='observe',hosts=[{'id':'pc','address':'example'}]))
             rows=[task(),task(2,status=3),task(3,received=20),task(4,speed=1)]
             with patch('manual_actions.read_live_tasks',return_value=rows):
@@ -34,7 +34,7 @@ class ManualTests(unittest.TestCase):
                 with self.assertRaises(ValueError):m.actions.execute(p['plan'],'')
 
     def test_batch_freezes_preview_and_stops_on_uncertainty(self):
-        with tempfile.TemporaryDirectory() as d,patch('monitor.ROOT',Path(d)):
+        with tempfile.TemporaryDirectory() as d,patch('monitor.DATA',Path(d)):
             m=Monitor(dict(poll_seconds=15,idle_seconds=600,hosts=[{'id':'pc','address':'example'}]))
             with patch('manual_actions.read_live_tasks',return_value=[task(),task(2)]):p=m.actions.prepare('pc','pause_zero')
             with patch('manual_actions.perform',side_effect=TimeoutError()) as call,patch.object(m,'_poll_host'):
@@ -60,7 +60,7 @@ class ManualHTTPTests(unittest.TestCase):
         import json,urllib.request,urllib.error
         from http.server import ThreadingHTTPServer
         from monitor import handler_for
-        with tempfile.TemporaryDirectory() as d,patch('monitor.ROOT',Path(d)):
+        with tempfile.TemporaryDirectory() as d,patch('monitor.DATA',Path(d)):
             m=Monitor(dict(poll_seconds=15,idle_seconds=600,hosts=[{'id':'pc','address':'example'}]))
             server=ThreadingHTTPServer(('127.0.0.1',0),handler_for(m,'test-token'))
             thread=threading.Thread(target=server.serve_forever);thread.start()

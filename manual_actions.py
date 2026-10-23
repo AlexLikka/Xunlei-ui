@@ -60,11 +60,11 @@ if($p.mode -eq 'pause'){
 """
 
 
-def perform(host, command, task):
+def perform(host, command, task, data_dir=None):
     _, mode, files, under20, bulk = COMMANDS[command]
     payload = dict(id=task['id'], name=task['name'], path=task['save_path'], mode=mode, files=files, under20=under20, bulk=bulk)
     encoded = base64.b64encode(json.dumps(payload, ensure_ascii=False).encode()).decode()
-    result = remote(host, ACTION.replace('__PAYLOAD__', encoded))
+    result = remote(host, ACTION.replace('__PAYLOAD__', encoded), data_dir)
     if result.get('outcome') not in ('paused', 'deleted', 'skipped'):
         raise RuntimeError('操作结果无法确认')
     if result['outcome'] == 'deleted' and (mode != 'delete' or result.get('filesRequested') is not files):
@@ -102,7 +102,7 @@ class ManualActions:
         if not bulk and (type(task_id) is not int or task_id < 0):
             raise ValueError('请指定任务 ID')
         with self.monitor.operation_locks[host_id]:
-            rows = read_live_tasks(host)
+            rows = read_live_tasks(host, self.monitor.data_dir)
         tasks = [t for t in rows if candidate(t,under20)] if bulk else [t for t in rows if t['id'] == task_id]
         if not bulk and not tasks:
             raise ValueError('任务不存在或已完成，请刷新列表')
@@ -152,7 +152,7 @@ class ManualActions:
                         try:
                             self.monitor.record(host_id,task['id'],'manual_started')
                             self.monitor.uncertain.add(key)
-                            result=perform(host,command,task)
+                            result=perform(host,command,task,self.monitor.data_dir)
                             event={'paused':'manual_paused','deleted':'manual_deleted_files' if COMMANDS[command][2] else 'manual_deleted_keep_files','skipped':'manual_skipped_changed'}[result['outcome']]
                             self.monitor.record(host_id,task['id'],event)
                             if result['outcome'] in ('paused','skipped'):

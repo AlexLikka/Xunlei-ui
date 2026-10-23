@@ -45,7 +45,7 @@ class MonitorSafetyTests(unittest.TestCase):
         from pathlib import Path
         from unittest.mock import patch
         import monitor
-        with tempfile.TemporaryDirectory() as directory, patch.object(monitor,'ROOT',Path(directory)):
+        with tempfile.TemporaryDirectory() as directory, patch.object(monitor,'DATA',Path(directory)):
             config=dict(mode=mode,poll_seconds=5,idle_seconds=10,hosts=[{'id':'pc','address':'example'}])
             m=monitor.Monitor(config)
             r={**row(), 'completed':0}

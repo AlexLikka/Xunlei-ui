@@ -5,12 +5,17 @@ import json
 import time
 from pathlib import Path
 import paramiko
+from paths import DATA
 
 ROOT = Path(__file__).resolve().parent
 
 
-def remote(host, action):
-    credentials = (ROOT / host['credentials_file']).read_text(encoding='utf-8-sig').splitlines()
+def remote(host, action, data_dir=None):
+    root = Path(data_dir).resolve() if data_dir is not None else DATA
+    credential_path = (root / host['credentials_file']).resolve()
+    if data_dir is not None:
+        credential_path.relative_to(root)
+    credentials = credential_path.read_text(encoding='utf-8-sig').splitlines()
     if len(credentials) < 2:
         raise ValueError('凭据需要两行')
     script = (ROOT / 'remote/thunder_ipc.ps1').read_text().replace('__ACTION__', action)
@@ -22,7 +27,7 @@ def remote(host, action):
     if len(command) > 8000:
         raise ValueError('命令超出 Windows 长度限制')
     client = paramiko.SSHClient()
-    client.load_host_keys(str(ROOT / '.runtime/known_hosts'))
+    client.load_host_keys(str(root / '.runtime/known_hosts'))
     client.set_missing_host_key_policy(paramiko.RejectPolicy())
     try:
         client.connect(host['address'], port=host.get('port',22), username=credentials[0], password=credentials[1],
@@ -81,8 +86,8 @@ def number(value, optional=False):
     return value
 
 
-def read_live_tasks(host):
-    data = remote(host, LIST)
+def read_live_tasks(host, data_dir=None):
+    data = remote(host, LIST, data_dir)
     tasks = data.get('tasks')
     if not isinstance(tasks,list) or len(tasks)>10000:
         raise ValueError('无效任务列表')
@@ -123,8 +128,8 @@ Write-CliResult @{deleted=$true;filesDeleted=$false;taskId=$id}
 """
 
 
-def remove_keep_files(host, task):
+def remove_keep_files(host, task, data_dir=None):
     action=DELETE.replace('__ID__',str(number(task['id']))).replace('__BYTES__',str(number(task['received'])))
     for key,field in [('__NAME__','name'),('__PATH__','save_path')]:
         action=action.replace(key,base64.b64encode(task[field].encode()).decode())
-    return remote(host,action)
+    return remote(host,action,data_dir)

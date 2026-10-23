@@ -105,3 +105,24 @@ class MachineSettings:
         # Saved even on authentication/version failure, so diagnostics remain visible.
         result=self.m.poll_host(h)
         return {'saved':True,'id':h['id'],'state':result['state'],'error':result.get('error')}
+
+    def credentials(self, body):
+        host=self.m.actions.host(body.get('host'))
+        user=body.get('username');password=body.get('password')
+        if not host:raise ValueError('请选择机器')
+        if not isinstance(user,str) or not user.strip() or not isinstance(password,str) or not password or len(user)>256 or len(password)>4096 or any(c in user+password for c in '\r\n\0'):
+            raise ValueError('SSH 用户名或密码无效')
+        with self.m.operation_locks[host['id']], self.m.lock:
+            if self.m.stop.is_set():raise ValueError('服务正在关闭')
+            folder=self.root/'.runtime/credentials';folder.mkdir(mode=0o700,parents=True,exist_ok=True)
+            path=folder/(secrets.token_hex(16)+'.txt')
+            fd=os.open(path,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
+            with os.fdopen(fd,'w') as f:f.write(user.strip()+'\n'+password+'\n')
+            config=json.loads(json.dumps(self.m.config))
+            entry=next(h for h in config['hosts'] if h['id']==host['id'])
+            entry['credentials_file']=str(path.relative_to(self.root))
+            try:self.save(config)
+            except Exception:path.unlink(missing_ok=True);raise
+            host['credentials_file']=entry['credentials_file']
+            self.m.trackers[host['id']].clear()
+        return {'saved':True}

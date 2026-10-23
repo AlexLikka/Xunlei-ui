@@ -20,6 +20,8 @@ from live_tracker import LiveTracker
 from manual_actions import ManualActions
 from machine_settings import MachineSettings
 from fleet import Fleet
+from paths import DATA, initialize
+from web_auth import Auth, protected_handler
 
 ROOT = Path(__file__).resolve().parent
 
@@ -36,8 +38,8 @@ def load_config(path):
     if conf['idle_seconds'] < conf['poll_seconds'] * 2:
         raise ValueError('零速时间至少为两倍采样间隔')
     hosts = conf['hosts']
-    if not hosts or len({h['id'] for h in hosts}) != len(hosts):
-        raise ValueError('至少配置一台主机，且 id 必须唯一')
+    if not isinstance(hosts,list) or len({h['id'] for h in hosts}) != len(hosts):
+        raise ValueError('主机 id 必须唯一')
     for h in hosts:
         for key in ('id', 'address', 'credentials_file'):
             if not isinstance(h.get(key), str) or not h[key]:
@@ -50,14 +52,15 @@ def load_config(path):
 
 
 class Monitor:
-    def __init__(self, config, config_path=None):
+    def __init__(self, config, config_path=None, data_dir=None):
+        self.data_dir = Path(data_dir) if data_dir is not None else DATA
         self.config = config
         self.lock = threading.RLock()
-        self.settings = MachineSettings(self, ROOT, config_path or ROOT / "config.json")
+        self.settings = MachineSettings(self, self.data_dir, config_path or self.data_dir / "config.json")
         self.stop = threading.Event()
         self.events = []
         self.uncertain = set()
-        journal = ROOT / '.runtime/events.jsonl'
+        journal = self.data_dir / '.runtime/events.jsonl'
         if journal.exists():
             for line in journal.read_text().splitlines():
                 entry = json.loads(line)
@@ -82,7 +85,7 @@ class Monitor:
             return self.hosts[host['id']]
         tracker = self.trackers[host['id']]
         try:
-            rows = read_live_tasks(host)
+            rows = read_live_tasks(host, self.data_dir)
             result = {'id': host['id'], 'address': host['address'], 'state': '在线',
                       'checked_at': time.time(), 'tasks': tracker.update(rows, time.monotonic())}
             for task in result['tasks']:
@@ -102,7 +105,7 @@ class Monitor:
                     # Persist before sending: a crash/timeout must not replay a mutation.
                     self.record(host['id'], task['id'], 'attempt_started')
                     try:
-                        outcome = remove_keep_files(host, task)
+                        outcome = remove_keep_files(host, task, self.data_dir)
                         if outcome.get('deleted') is True and outcome.get('filesDeleted') is False:
                             event = 'removed_keep_files'
                             result['tasks'] = [t for t in result['tasks'] if t['id'] != task['id']]
@@ -134,7 +137,7 @@ class Monitor:
     def record(self, host, task_id, event):
         entry = dict(time=time.time(), host=host, task_id=task_id, event=event)
         with self.lock:
-            path = ROOT / '.runtime/events.jsonl'
+            path = self.data_dir / '.runtime/events.jsonl'
             path.parent.mkdir(mode=0o700, exist_ok=True)
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
             with os.fdopen(fd, 'a') as log:
@@ -163,6 +166,10 @@ class Monitor:
 
 def handler_for(monitor, shutdown_token=None):
     class Handler(BaseHTTPRequestHandler):
+        @property
+        def monitor(self):
+            return monitor
+
         def json_response(self, data, status=200):
             raw = json.dumps(data, ensure_ascii=False).encode()
             self.send_response(status)
@@ -179,7 +186,7 @@ def handler_for(monitor, shutdown_token=None):
                     self.headers.get('Sec-Fetch-Site') not in ('cross-site',))
 
         def do_POST(self):
-            if self.path not in ('/api/shutdown','/api/actions/preview','/api/actions/execute','/api/actions/status','/api/refresh','/api/settings/automation','/api/hosts/probe','/api/hosts/add','/api/fleet/accelerate'):
+            if self.path not in ('/api/shutdown','/api/actions/preview','/api/actions/execute','/api/actions/status','/api/refresh','/api/settings/automation','/api/settings/credentials','/api/hosts/probe','/api/hosts/add','/api/fleet/accelerate'):
                 self.send_error(404)
                 return
             supplied = self.headers.get('X-Monitor-Token', '')
@@ -187,7 +194,7 @@ def handler_for(monitor, shutdown_token=None):
                 self.send_error(403)
                 return
             if self.path == '/api/shutdown':
-                monitor.stop.set()
+                self.monitor.stop.set()
                 self.json_response({'stopping':True},202)
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
@@ -199,24 +206,26 @@ def handler_for(monitor, shutdown_token=None):
                 if not isinstance(body,dict):
                     raise ValueError('请求格式无效')
                 if self.path == '/api/fleet/accelerate':
-                    result=monitor.fleet.start()
+                    result=self.monitor.fleet.start()
+                elif self.path == '/api/settings/credentials':
+                    result=self.monitor.settings.credentials(body)
                 elif self.path == '/api/settings/automation':
-                    result=monitor.settings.automation(body)
+                    result=self.monitor.settings.automation(body)
                 elif self.path == '/api/hosts/probe':
-                    result=monitor.settings.probe(body)
+                    result=self.monitor.settings.probe(body)
                 elif self.path == '/api/hosts/add':
-                    result=monitor.settings.add(body)
+                    result=self.monitor.settings.add(body)
                 elif self.path == '/api/actions/preview':
-                    result=monitor.actions.prepare(body.get('host'),body.get('command'),body.get('task_id'))
+                    result=self.monitor.actions.prepare(body.get('host'),body.get('command'),body.get('task_id'))
                 elif self.path == '/api/actions/execute':
-                    result={'job':monitor.actions.execute(body.get('plan'),body.get('confirmation'))}
+                    result={'job':self.monitor.actions.execute(body.get('plan'),body.get('confirmation'))}
                 elif self.path == '/api/actions/status':
-                    result=monitor.actions.status(body.get('job'))
+                    result=self.monitor.actions.status(body.get('job'))
                 else:
-                    host=monitor.actions.host(body.get('host'))
+                    host=self.monitor.actions.host(body.get('host'))
                     if not host:raise ValueError('请选择一台主机')
-                    with monitor.operation_locks[host['id']]:
-                        result=monitor._poll_host(host,allow_auto=False)
+                    with self.monitor.operation_locks[host['id']]:
+                        result=self.monitor._poll_host(host,allow_auto=False)
                 self.json_response(result)
             except (ValueError,TypeError) as exc:
                 self.json_response({'error':str(exc)},400)
@@ -231,7 +240,7 @@ def handler_for(monitor, shutdown_token=None):
                 self.json_response({'token': shutdown_token})
                 return
             if self.path == '/api/status':
-                data = json.dumps(monitor.snapshot(), ensure_ascii=False).encode()
+                data = json.dumps(self.monitor.snapshot(), ensure_ascii=False).encode()
                 mime = 'application/json; charset=utf-8'
             elif self.path == '/style.css':
                 data = (ROOT / 'web/style.css').read_bytes()
@@ -261,7 +270,7 @@ def handler_for(monitor, shutdown_token=None):
 
 def main():
     parser = argparse.ArgumentParser(description='迅雷多主机实时监控')
-    parser.add_argument('--config', type=Path, default=ROOT / 'config.json')
+    parser.add_argument('--config', type=Path, default=DATA / 'config.json')
     parser.add_argument('--once', action='store_true', help='只读查询一次，输出数量摘要')
     parser.add_argument('--stop', action='store_true', help='关闭本目录启动的监控')
     parser.add_argument('--open-browser', action='store_true', help='启动后打开面板')
@@ -269,17 +278,17 @@ def main():
     args = parser.parse_args()
     if args.stop:
         try:
-            print(stop_instance(ROOT / '.runtime'))
+            print(stop_instance(DATA / '.runtime'))
             return 0
         except RuntimeError as exc:
             print(str(exc))
             return 1
+    initialize()
     config = load_config(args.config)
     if args.auto:
-        config['mode'] = 'auto'
-        for h in config['hosts']:h['auto_enabled']=True
-    monitor = Monitor(config, args.config)
+        parser.error('平台模式请登录各自账号，在网页中开启自动清理')
     if args.once:
+        monitor = Monitor(config, args.config)
         monitor.config = {**config, 'mode':'observe'}
         for h in config['hosts']:h['auto_enabled']=False
         failed = False
@@ -288,22 +297,26 @@ def main():
             failed |= result['state'] != '在线'
             print(json.dumps({k: v for k, v in result.items() if k != 'tasks'} | {'task_count': len(result['tasks'])}, ensure_ascii=False))
         return int(failed)
-    instance = Instance(ROOT / '.runtime')
+    instance = Instance(DATA / '.runtime')
     if not instance.acquire():
         print('监控已经运行，无需重复启动。双击“关闭监控.command”可停止。')
         return 1
     server = None
-    worker = None
+    workspaces = None
     try:
-        server = ThreadingHTTPServer(('127.0.0.1', config.get('listen_port', 8765)), handler_for(monitor, instance.token))
+        from workspaces import Workspaces
+        auth = Auth(DATA / '.runtime', secure=os.environ.get('THUNDER_SECURE_COOKIE') == '1')
+        workspaces = Workspaces(DATA, auth, Monitor, load_config)
+        bind = os.environ.get('THUNDER_BIND', '0.0.0.0')
+        server = ThreadingHTTPServer((bind, int(os.environ.get('THUNDER_PORT', config.get('listen_port', 8765)))), protected_handler(handler_for(None, instance.token), auth, instance.token, workspaces))
+        server.daemon_threads = True
         instance.publish(server.server_port)
-        worker = threading.Thread(target=monitor.run, daemon=True)
-        worker.start()
+        workspaces.start()
         def request_stop(signum, frame):
-            monitor.stop.set()
+            workspaces.request_stop()
             threading.Thread(target=server.shutdown, daemon=True).start()
         signal.signal(signal.SIGTERM, request_stop)
-        print(f"监控面板：http://127.0.0.1:{server.server_port} （双击关闭监控.command 可停止）", flush=True)
+        print(f"Thunder 平台：http://{bind}:{server.server_port}；开放注册，各账号独立空间", flush=True)
         if args.open_browser:
             webbrowser.open(f'http://127.0.0.1:{server.server_port}')
         server.serve_forever()
@@ -313,13 +326,12 @@ def main():
         print(f'无法启动监控：端口可能已被占用（{exc.__class__.__name__}）。')
         return 1
     finally:
-        monitor.stop.set()
+        if workspaces:
+            workspaces.request_stop()
         if server:
             server.server_close()
-        if worker:
-            worker.join()
-        monitor.fleet.join()
-        monitor.actions.join()
+        if workspaces:
+            workspaces.close()
         instance.close()
     return 0
 

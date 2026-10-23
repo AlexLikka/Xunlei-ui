@@ -1,0 +1,19 @@
+name: thunder-tool
+services:
+  thunder:
+    build: .
+    ports:
+      - "${THUNDER_PUBLISH_IP:-0.0.0.0}:8765:8765"
+    environment:
+      THUNDER_SECURE_COOKIE: "${THUNDER_SECURE_COOKIE:-0}"
+    volumes:
+      - thunder-data:/data
+    restart: unless-stopped
+    stop_grace_period: 120s
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+volumes:
+  thunder-data:

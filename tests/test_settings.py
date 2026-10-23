@@ -14,7 +14,7 @@ class SettingsTests(unittest.TestCase):
         return Monitor(conf,root/'config.json')
 
     def test_independent_auto_persistence_and_reset(self):
-        with tempfile.TemporaryDirectory() as d,patch('monitor.ROOT',Path(d)):
+        with tempfile.TemporaryDirectory() as d,patch('monitor.DATA',Path(d)):
             m=self.setup_monitor(d);m.trackers['one'].previous[1]={'x':1}
             m.settings.automation(dict(host='one',enabled=True,idle_seconds=120))
             snap=m.snapshot()['hosts'];self.assertTrue(snap[0]['auto_enabled']);self.assertFalse(snap[1]['auto_enabled'])
@@ -25,7 +25,7 @@ class SettingsTests(unittest.TestCase):
             with self.assertRaises(ValueError):m.settings.automation(dict(host='one',enabled=True,idle_seconds=1))
 
     def test_add_defaults_observe_secrets_and_dynamic_state(self):
-        with tempfile.TemporaryDirectory() as d,patch('monitor.ROOT',Path(d)):
+        with tempfile.TemporaryDirectory() as d,patch('monitor.DATA',Path(d)):
             m=self.setup_monitor(d);key=paramiko.RSAKey.generate(1024)
             m.settings.pending['token']=dict(id='three',address='10.0.0.3',port=22,alias='10.0.0.3',key=key,expires=time.monotonic()+120)
             with patch.object(m,'poll_host',return_value={'state':'异常','error':'不兼容'}):
@@ -39,7 +39,7 @@ class SettingsTests(unittest.TestCase):
             with self.assertRaises(ValueError):m.settings.add(dict(probe='token',trust=True))
 
     def test_reuse_does_not_expose_credentials(self):
-        with tempfile.TemporaryDirectory() as d,patch('monitor.ROOT',Path(d)):
+        with tempfile.TemporaryDirectory() as d,patch('monitor.DATA',Path(d)):
             m=self.setup_monitor(d);key=paramiko.RSAKey.generate(1024)
             m.settings.pending['t']=dict(id='three',address='10.0.0.3',port=2222,alias='[10.0.0.3]:2222',key=key,expires=time.monotonic()+120)
             with patch.object(m,'poll_host',return_value={'state':'在线'}):m.settings.add(dict(probe='t',trust=True,credentials_from='one'))
@@ -48,7 +48,7 @@ class SettingsTests(unittest.TestCase):
 
     def test_probe_changed_key_and_confirmation(self):
         from unittest.mock import MagicMock
-        with tempfile.TemporaryDirectory() as d,patch('monitor.ROOT',Path(d)):
+        with tempfile.TemporaryDirectory() as d,patch('monitor.DATA',Path(d)):
             m=self.setup_monitor(d);key=paramiko.RSAKey.generate(1024)
             transport=MagicMock();transport.get_remote_server_key.return_value=key
             with patch('machine_settings.socket.create_connection'),patch('machine_settings.paramiko.Transport',return_value=transport):
@@ -62,7 +62,20 @@ class SettingsTests(unittest.TestCase):
                 with self.assertRaises(ValueError):m.settings.probe(dict(id='new',address='10.0.0.4',port=22))
 
     def test_probe_duplicate_and_input_validation(self):
-        with tempfile.TemporaryDirectory() as d,patch('monitor.ROOT',Path(d)):
+        with tempfile.TemporaryDirectory() as d,patch('monitor.DATA',Path(d)):
             m=self.setup_monitor(d)
             for b in [dict(id='one',address='10.0.0.8',port=22),dict(id='x',address='10.0.0.1',port=22),dict(id='../../x',address='10.0.0.8',port=22),dict(id='x',address='invalid',port=22),dict(id='x',address='10.0.0.8',port=0)]:
                 with self.assertRaises(ValueError):m.settings.probe(b)
+
+    def test_credential_update_does_not_change_reused_source(self):
+        with tempfile.TemporaryDirectory() as d,patch('monitor.DATA',Path(d)):
+            m=self.setup_monitor(d)
+            m.settings.credentials(dict(host='one',username='new-user',password='new-secret'))
+            first,second=m.config['hosts']
+            self.assertEqual(second['credentials_file'],'password.txt')
+            self.assertNotEqual(first['credentials_file'],second['credentials_file'])
+            p=Path(d)/first['credentials_file']
+            self.assertEqual(p.read_text(),'new-user\nnew-secret\n')
+            self.assertEqual(p.stat().st_mode&0o777,0o600)
+            self.assertNotIn('new-secret',json.dumps(m.snapshot()))
+            self.assertEqual(load_config(Path(d)/'config.json')['hosts'][0]['credentials_file'],first['credentials_file'])
