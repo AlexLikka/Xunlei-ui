@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+账号密码.txt
+*credentials*.txt
+config.json
+.runtime/
+
+迅雷状态模块-查看删除CLI-v1.py
