@@ -14,7 +14,7 @@ sudo docker compose up -d --build --wait
 
 登录后点击「添加机器」，填写机器 IP 和 SSH 端口，输入 SSH 账号密码，核对主机密钥指纹后添加。复用凭据仅限当前账号已有的机器。新机器默认关闭自动清理；机器设置及任务操作均只作用于当前用户空间。
 
-平台服务器需要能连接目标 Windows 的 SSH，且目标机器的迅雷正在运行。远程 Windows 不需要安装本工具；访问私网目标时需要已有的 VPN 或内网路由。
+平台服务器需要能连接目标 Windows 的 SSH，且目标机器的迅雷正在运行。普通监控不需要在远程 Windows 安装 Python；云盘功能会上传 PowerShell 模块并登记一次性计划任务，要求交互用户保持登录且迅雷已登录云盘。访问私网目标时需要已有的 VPN 或内网路由。
 
 ```sh
 sudo docker compose ps
@@ -77,20 +77,25 @@ THUNDER_SECURE_COOKIE=1
 
 `THUNDER_SECURE_COOKIE=1` 适用于 HTTPS 入口，此时浏览器只通过 HTTPS 发送会话 Cookie。反向代理需保留原始 Host。直接使用 `http://服务器IP:8765` 时保持默认的 `THUNDER_SECURE_COOKIE=0`。
 
-## 本服务器构建
+## 低配服务器与封档停机
 
-本服务器 Docker 后台直连 Docker Hub 会超时。官方 Python 基础镜像已通过现有代理下载、校验并导入 Docker。基础镜像在本地时，更新代码可执行：
+Compose 默认为 2 核 / 2 GB 主机限制容器资源：384 MB 内存、1 核 CPU、128 个进程 / 线程。可在 `.env` 设置 `THUNDER_MEMORY_LIMIT`（例如 `512m`）和 `THUNDER_CPU_LIMIT`，重建容器后生效。
+
+如果构建环境必须经过代理，可使用 Docker 标准构建代理参数；代理地址取决于自己的网络环境，不需要写入镜像或提交仓库。
 
 ```sh
-sudo docker build --network host \
-  --build-arg HTTP_PROXY=http://127.0.0.1:7890 \
-  --build-arg HTTPS_PROXY=http://127.0.0.1:7890 \
-  -t thunder-tool-thunder .
+sudo docker build --build-arg HTTP_PROXY --build-arg HTTPS_PROXY -t thunder-tool-thunder .
 sudo docker compose up -d --no-build --wait
 ```
 
-当前 Compose 项目名为 `thunder-tool`，容器名为 `thunder-tool-thunder-1`。现有 4 台机器迁移到指定的 `Likka` 账号，其他新账号不继承这些信息。部署时验证公开注册、登录、账号隔离、重启后的持久化及 HTTP 健康状态；到各 Windows 的 SSH 网络连通性不代表所有迅雷版本均兼容。
+最终源码于 2026-10-29 封档。长期停止并关闭现有容器的自动重启：
 
-## 本次上线验证
+```sh
+sudo docker update --restart=no thunder-tool-thunder-1
+sudo docker compose stop
+sudo docker inspect thunder-tool-thunder-1 --format '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}'
+```
 
-2026-10-23：49 项 Python 测试全部通过；JavaScript 语法及注册交互模拟通过；独立 HTTP 环境验证公开注册、旧账号 4 台机器、新账号空空间、越权拒绝、CSRF、重启持久化。正式服务验证 `Likka` 可登录，4 台机器均实时在线；已通过服务器网卡 IP 的 8765 端口访问，并实测服务退出后自动恢复为 healthy。旧版完整数据备份保存在项目的 `backup/before-multiuser-20261023.tar`，权限 0600。
+这些命令保留容器与数据卷。以后执行 `docker compose up -d` 会主动重新启动服务，也可能重新应用 Compose 中的 `unless-stopped` 策略。停止 Web 不会取消已经提交到 Windows 的一次性计划任务或迅雷下载。
+
+仓库仅含代码和空配置示例；真实账号、机器、凭据、备份及原始含凭据 CLI 均不发布。已验证的迅雷版本为 Windows `25.1.12.1624`；其他版本情况及功能限制见 [README](../README.md)。

@@ -2,6 +2,7 @@
 from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+import gzip
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import math
@@ -15,12 +16,15 @@ import os
 
 import paramiko
 from local_control import Instance, stop_instance
-from thunder_api import read_live_tasks, remove_keep_files
+from thunder_api import read_live_tasks, read_task_archive, remove_keep_files
 from live_tracker import LiveTracker
 from manual_actions import ManualActions
 from machine_settings import MachineSettings
 from fleet import Fleet
+from cloud_transfer import CloudTransfers
 from paths import DATA, initialize
+from previews import Previews
+from resource_limits import POLL_WORKERS
 from web_auth import Auth, protected_handler
 
 ROOT = Path(__file__).resolve().parent
@@ -59,36 +63,73 @@ class Monitor:
         self.settings = MachineSettings(self, self.data_dir, config_path or self.data_dir / "config.json")
         self.stop = threading.Event()
         self.events = []
+        self.archives = {}
         self.uncertain = set()
         journal = self.data_dir / '.runtime/events.jsonl'
         if journal.exists():
-            for line in journal.read_text().splitlines():
-                entry = json.loads(line)
-                key = (entry['host'], entry['task_id'])
-                if entry['event'] in ('skipped_changed','manual_paused','manual_skipped_changed'):
-                    self.uncertain.discard(key)
-                else:
-                    self.uncertain.add(key)
-                self.events = (self.events + [entry])[-100:]
+            with journal.open() as lines:
+                for line in lines:
+                    entry = json.loads(line)
+                    key = (entry['host'], entry['task_id'])
+                    if entry['event'] in ('skipped_changed','manual_paused','manual_resumed','manual_skipped_changed'):
+                        self.uncertain.discard(key)
+                    else:
+                        self.uncertain.add(key)
+                    self.events = (self.events + [entry])[-100:]
         self.operation_locks = {h['id']: threading.RLock() for h in config['hosts']}
         self.actions = ManualActions(self)
+        self.cloud = CloudTransfers(self)
+        self.previews = Previews(self)
         self.fleet = Fleet(self)
         self.trackers = {h['id']: LiveTracker(h.get('idle_seconds',config['idle_seconds']), config['poll_seconds'] * 2) for h in config['hosts']}
         self.hosts = {h['id']: {'id': h['id'], 'address': h['address'], 'state': '等待连接', 'tasks': []} for h in config['hosts']}
 
     def poll_host(self, host):
         with self.operation_locks[host['id']]:
-            return self._poll_host(host)
+            if self.actions.host(host['id']) is not host:
+                return dict(id=host['id'],state='配置已变化',tasks=[])
+            result = self._poll_host(host, include_archives=False)
+        # Archive reads do not mutate tasks. Release the operation lock first
+        # so a submitted action need not wait for two additional full lists.
+        if result['state'] == '在线':
+            self.refresh_archives(host)
+        return result
 
-    def _poll_host(self, host, allow_auto=True):
+    def refresh_archives(self, host, force=False):
+        for view in ('completed', 'recycle'):
+            if self.stop.is_set() or self.actions.host(host['id']) is not host:
+                return
+            with self.lock:
+                previous = self.archives.get(host['id'], {}).get(view, {})
+            if not force and time.monotonic() - previous.get('attempted_at', -float('inf')) < 60:
+                continue
+            attempted_at = time.monotonic()
+            try:
+                tasks = read_task_archive(host, view, self.data_dir)
+                entry = dict(tasks=tasks, state='ready', checked_at=time.time(), attempted_at=attempted_at)
+            except Exception:
+                entry = dict(previous, state='error', attempted_at=attempted_at,
+                             error='归档读取失败，当前显示上次结果；请刷新或检查连接')
+                entry.setdefault('tasks', [])
+            with self.lock:
+                if self.actions.host(host['id']) is host:
+                    self.archives.setdefault(host['id'], {})[view] = entry
+
+    def _poll_host(self, host, allow_auto=True, force_archives=False, include_archives=True):
+        if self.actions.host(host['id']) is not host:
+            raise ValueError('机器配置已变化，请刷新后重试')
         if self.stop.is_set():
             return self.hosts[host['id']]
         tracker = self.trackers[host['id']]
         try:
-            rows = read_live_tasks(host, self.data_dir)
+            rows = [t for t in read_live_tasks(host, self.data_dir)
+                    if not t.get('read_only') and t.get('view', 'incomplete') == 'incomplete'
+                    and not t.get('recycle_time', 0)]
             result = {'id': host['id'], 'address': host['address'], 'state': '在线',
                       'checked_at': time.time(), 'tasks': tracker.update(rows, time.monotonic())}
             for task in result['tasks']:
+                if self.cloud.protected(host['id'], task['id']):
+                    task.update(delete_eligible=False, needs_review=False, protection_reason='已有云盘转存记录，禁止重复清理')
                 if (host['id'], task['id']) in self.uncertain:
                     task['delete_eligible'] = False
                     task['needs_review'] = False
@@ -132,6 +173,9 @@ class Monitor:
         self.fleet.sample(result)
         with self.lock:
             self.hosts[host['id']] = result
+        if result['state'] == '在线' and include_archives:
+            self.refresh_archives(host, force=force_archives)
+        self.cloud.refresh_async(host['id'])
         return result
 
     def record(self, host, task_id, event):
@@ -148,14 +192,19 @@ class Monitor:
 
     def snapshot(self):
         with self.lock:
-            hosts=[{**self.hosts[h['id']], 'auto_enabled':h.get('auto_enabled',self.config.get('mode')=='auto'), 'idle_seconds':h.get('idle_seconds',self.config['idle_seconds'])} for h in self.config['hosts']]
+            hosts=[{**self.hosts[h['id']], 'name':h.get('name',h['id']), 'port':h.get('port',22), 'auto_enabled':h.get('auto_enabled',self.config.get('mode')=='auto'),
+                    'idle_seconds':h.get('idle_seconds',self.config['idle_seconds']),
+                    'archives':{view:{k:v for k,v in self.archives.get(h['id'],{}).get(view,dict(tasks=[],state='pending')).items() if k!='attempted_at'}
+                                for view in ('completed','recycle')}} for h in self.config['hosts']]
             result={'mode':self.config.get('mode','observe'),'delete_supported':True,'events':list(self.events),
                     'poll_seconds':self.config['poll_seconds'],'idle_seconds':self.config['idle_seconds'],'hosts':hosts}
         result['fleet']=self.fleet.snapshot(hosts)
+        result['cloud']=self.cloud.snapshot()
+        result['manual_jobs']=self.actions.snapshot()
         return result
 
     def run(self):
-        with ThreadPoolExecutor(max_workers=16) as pool:
+        with ThreadPoolExecutor(max_workers=POLL_WORKERS) as pool:
             while not self.stop.is_set():
                 started = time.monotonic()
                 with self.lock:
@@ -172,12 +221,35 @@ def handler_for(monitor, shutdown_token=None):
 
         def json_response(self, data, status=200):
             raw = json.dumps(data, ensure_ascii=False).encode()
+            raw, encoding = self.compress_response(raw)
             self.send_response(status)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.send_header('Cache-Control', 'no-store')
+            if encoding:
+                self.send_header('Content-Encoding', encoding)
+                self.send_header('Vary', 'Accept-Encoding')
             self.send_header('Content-Length', str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
+
+        def compress_response(self, raw):
+            # Status snapshots can contain thousands of task rows. Compress
+            # only when the client advertises support; old API clients and
+            # the unit-test request shim continue to receive plain JSON.
+            supported = False
+            for item in self.headers.get('Accept-Encoding', '').lower().split(','):
+                parts = [part.strip() for part in item.split(';')]
+                if parts[0] != 'gzip':
+                    continue
+                quality = next((part[2:] for part in parts[1:] if part.startswith('q=')), '1')
+                try:
+                    supported = float(quality) > 0
+                except ValueError:
+                    supported = False
+                break
+            if not supported or len(raw) < 1024:
+                return raw, None
+            return gzip.compress(raw, compresslevel=6, mtime=0), 'gzip'
 
         def local_request(self):
             expected = f'127.0.0.1:{self.server.server_port}'
@@ -186,7 +258,7 @@ def handler_for(monitor, shutdown_token=None):
                     self.headers.get('Sec-Fetch-Site') not in ('cross-site',))
 
         def do_POST(self):
-            if self.path not in ('/api/shutdown','/api/actions/preview','/api/actions/execute','/api/actions/status','/api/refresh','/api/settings/automation','/api/settings/credentials','/api/hosts/probe','/api/hosts/add','/api/fleet/accelerate'):
+            if self.path not in ('/api/shutdown','/api/actions/preview','/api/actions/execute','/api/actions/status','/api/refresh','/api/settings/automation','/api/settings/credentials','/api/hosts/probe','/api/hosts/add','/api/hosts/update','/api/hosts/delete','/api/fleet/accelerate','/api/cloud/preview','/api/cloud/execute','/api/cloud/inspect','/api/previews/start','/api/previews/status'):
                 self.send_error(404)
                 return
             supplied = self.headers.get('X-Monitor-Token', '')
@@ -205,8 +277,18 @@ def handler_for(monitor, shutdown_token=None):
                 body=json.loads(self.rfile.read(length))
                 if not isinstance(body,dict):
                     raise ValueError('请求格式无效')
-                if self.path == '/api/fleet/accelerate':
-                    result=self.monitor.fleet.start()
+                if self.path == '/api/previews/start':
+                    result=self.monitor.previews.start(body)
+                elif self.path == '/api/previews/status':
+                    result=self.monitor.previews.status(body.get('preview'))
+                elif self.path == '/api/fleet/accelerate':
+                    result=self.monitor.fleet.start(body)
+                elif self.path == '/api/cloud/preview':
+                    result=self.monitor.cloud.prepare(body)
+                elif self.path == '/api/cloud/execute':
+                    result=self.monitor.cloud.execute(body.get('plan'))
+                elif self.path == '/api/cloud/inspect':
+                    result=self.monitor.cloud.inspect(body)
                 elif self.path == '/api/settings/credentials':
                     result=self.monitor.settings.credentials(body)
                 elif self.path == '/api/settings/automation':
@@ -215,8 +297,12 @@ def handler_for(monitor, shutdown_token=None):
                     result=self.monitor.settings.probe(body)
                 elif self.path == '/api/hosts/add':
                     result=self.monitor.settings.add(body)
+                elif self.path == '/api/hosts/update':
+                    result=self.monitor.settings.update(body)
+                elif self.path == '/api/hosts/delete':
+                    result=self.monitor.settings.delete(body)
                 elif self.path == '/api/actions/preview':
-                    result=self.monitor.actions.prepare(body.get('host'),body.get('command'),body.get('task_id'))
+                    result=self.monitor.actions.prepare(body.get('host'),body.get('command'),body.get('task_id'),body.get('progress_limit'))
                 elif self.path == '/api/actions/execute':
                     result={'job':self.monitor.actions.execute(body.get('plan'),body.get('confirmation'))}
                 elif self.path == '/api/actions/status':
@@ -225,7 +311,7 @@ def handler_for(monitor, shutdown_token=None):
                     host=self.monitor.actions.host(body.get('host'))
                     if not host:raise ValueError('请选择一台主机')
                     with self.monitor.operation_locks[host['id']]:
-                        result=self.monitor._poll_host(host,allow_auto=False)
+                        result=self.monitor._poll_host(host,allow_auto=False,force_archives=True)
                 self.json_response(result)
             except (ValueError,TypeError) as exc:
                 self.json_response({'error':str(exc)},400)
@@ -254,9 +340,13 @@ def handler_for(monitor, shutdown_token=None):
             else:
                 self.send_error(404)
                 return
+            data, encoding = self.compress_response(data)
             self.send_response(200)
             self.send_header('Content-Type', mime)
             self.send_header('Content-Length', str(len(data)))
+            if encoding:
+                self.send_header('Content-Encoding', encoding)
+                self.send_header('Vary', 'Accept-Encoding')
             self.send_header('Cache-Control', 'no-store')
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'")

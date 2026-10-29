@@ -1,0 +1,12 @@
+{
+  "maxSpeedBytes": 0,
+  "stallSeconds": 600,
+  "pollSeconds": 15,
+  "maxProgressPercent": 95,
+  "instantWindowSeconds": 30,
+  "startGraceSeconds": 45,
+  "maxTransfersPerRound": 1,
+  "cloudFolderName": "WebUI云盘转存",
+  "localSubdirectory": "云盘转存",
+  "deleteOriginalFiles": false
+}

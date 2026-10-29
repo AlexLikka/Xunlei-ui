@@ -4,6 +4,7 @@ import json
 import secrets
 import threading
 import time
+from cloud_transfer import options
 
 
 def summarize(host, now, stale_after):
@@ -11,7 +12,12 @@ def summarize(host, now, stale_after):
     rows=host.get('tasks',[]) if fresh else []
     active=[t for t in rows if t.get('active') is True and t.get('status')==5]
     known=all(type(t.get('speed')) is int and t['speed']>=0 for t in active)
-    return dict(id=host['id'],fresh=fresh,speed=sum(t['speed'] for t in active) if fresh and known else None,
+    archives = {}
+    for view in ('completed', 'recycle'):
+        archive = host.get('archives', {}).get(view, {})
+        available = archive.get('state') == 'ready' and now-archive.get('checked_at',0) <= 180
+        archives[view] = len(archive.get('tasks', [])) if available else None
+    return dict(id=host['id'],fresh=fresh,**archives,speed=sum(t['speed'] for t in active) if fresh and known else None,
                 transmitting=sum(type(t.get('speed')) is int and t['speed']>0 for t in active),downloading=len(active),queued=sum(t.get('status')==3 for t in rows),
                 zero=sum(t.get('speed')==0 for t in active),paused=sum(t.get('status')==7 for t in rows),other=sum(t.get('status')!=3 and t.get('status')!=7 and not (t.get('status')==5 and t.get('active') is True) for t in rows),tasks=len(rows))
 
@@ -30,19 +36,36 @@ class Fleet:
     def snapshot(self, hosts):
         now=time.time();rows=[summarize(h,now,max(60,self.m.config['poll_seconds']*3)) for h in hosts]
         with self.lock:
+            self.history={h['id']:self.history[h['id']] for h in hosts if h['id'] in self.history}
             return dict(machines=rows,history=json.loads(json.dumps(self.history)),
                         acceleration=json.loads(json.dumps(self.current)),
                         speed=sum(r['speed'] or 0 for r in rows),known_speeds=sum(r['speed'] is not None for r in rows),
                         online=sum(r['fresh'] for r in rows),total=len(rows),paused=sum(r['paused'] for r in rows),other=sum(r['other'] for r in rows),tasks=sum(r['tasks'] for r in rows),
+                        completed=sum(r['completed'] or 0 for r in rows), recycle=sum(r['recycle'] or 0 for r in rows),
+                        completed_known=sum(r['completed'] is not None for r in rows),recycle_known=sum(r['recycle'] is not None for r in rows),
                         transmitting=sum(r['transmitting'] for r in rows),downloading=sum(r['downloading'] for r in rows),queued=sum(r['queued'] for r in rows),zero=sum(r['zero'] for r in rows))
 
-    def start(self):
+    def start(self, body=None):
+        opts=options(body or {})
+        supplied=(body or {}).get('plans')
+        prepared={}
+        if supplied is not None:
+            if not isinstance(supplied,list) or len(supplied)>10000:raise ValueError('加速预览列表无效')
+            with self.m.cloud.lock:
+                for item in supplied:
+                    if not isinstance(item,dict) or not isinstance(item.get('plan'),str):raise ValueError('加速预览无效')
+                    p=self.m.cloud.plans.get(item['plan'])
+                    if not p or p['expires']<=time.monotonic() or p['command']!='transfer':raise ValueError('加速预览已过期')
+                    if p['host'] in prepared:raise ValueError('机器预览重复')
+                    prepared[p['host']]={'plan':item['plan'],'count':len(p['tasks'])}
         with self.lock:
             if self.m.stop.is_set():raise ValueError('服务正在关闭')
             if self.current and self.current['state']=='running':return {'run':self.current['id'],'existing':True}
             with self.m.lock:hosts=list(self.m.config['hosts'])
+            if supplied is not None:hosts=[h for h in hosts if h['id'] in prepared]
+            self.prepared=prepared
             self.current=dict(id=secrets.token_hex(12),state='running',started=time.time(),
-                              hosts={h['id']:dict(state='waiting',matched=0,deleted=0,skipped=0,uncertain=0) for h in hosts})
+                              options=opts,hosts={h['id']:dict(state='waiting',matched=0,submitted=0,failed=0) for h in hosts})
             self.thread=threading.Thread(target=self._run,args=(hosts,),daemon=True);self.thread.start()
             return {'run':self.current['id'],'existing':False}
 
@@ -54,27 +77,20 @@ class Fleet:
         try:
             if self.m.stop.is_set():self.update(name,state='stopped');return
             self.update(name,state='checking')
-            plan=self.m.actions.prepare(name,'del_zero');token=plan['plan']
+            plan=self.prepared.get(name) or self.m.cloud.prepare(dict(self.current['options'],host=name,command='transfer'));token=plan['plan']
             self.update(name,matched=plan['count'])
             if plan['count']==0:self.update(name,state='done');return
-            job=self.m.actions.execute(token,'');token=None
-            self.update(name,state='running')
-            while True:
-                result=self.m.actions.status(job)
-                outcomes=[t['outcome'] for t in result['results']]
-                self.update(name,deleted=outcomes.count('deleted'),skipped=outcomes.count('skipped')+outcomes.count('blocked'),uncertain=outcomes.count('uncertain'))
-                if result['state']!='running':
-                    self.update(name,state=result['state']);return
-                time.sleep(.2)
+            result=self.m.cloud.execute(token);token=None
+            self.update(name,state='submitted',submitted=plan['count'],job=result['job'])
         except Exception:
-            self.update(name,state='error',error='连接、接口或任务操作失败；请查看该机器状态，未自动重试')
+            self.update(name,state='error',error='云盘转存提交失败，请核对该机器；未改用旧清理操作')
         finally:
             if token:
-                with self.m.actions.lock:self.m.actions.plans.pop(token,None)
+                with self.m.cloud.lock:self.m.cloud.plans.pop(token,None)
 
     def _run(self,hosts):
         try:
-            with ThreadPoolExecutor(max_workers=8) as pool:list(pool.map(self._host,hosts))
+            with ThreadPoolExecutor(max_workers=2) as pool:list(pool.map(self._host,hosts))
         finally:
             with self.lock:self.current['state']='finished';self.current['finished']=time.time()
 

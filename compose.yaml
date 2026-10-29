@@ -6,6 +6,11 @@ services:
       - "${THUNDER_PUBLISH_IP:-0.0.0.0}:8765:8765"
     environment:
       THUNDER_SECURE_COOKIE: "${THUNDER_SECURE_COOKIE:-0}"
+      MALLOC_ARENA_MAX: "2"
+    mem_limit: "${THUNDER_MEMORY_LIMIT:-384m}"
+    mem_reservation: 128m
+    cpus: "${THUNDER_CPU_LIMIT:-1.0}"
+    pids_limit: 128
     volumes:
       - thunder-data:/data
     restart: unless-stopped

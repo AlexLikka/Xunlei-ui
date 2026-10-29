@@ -2,23 +2,6 @@
   "poll_seconds": 15,
   "idle_seconds": 600,
   "listen_port": 8765,
-  "hosts": [
-    {
-      "id": "pc-103",
-      "address": "10.126.126.103",
-      "port": 22,
-      "credentials_file": "账号密码.txt",
-      "auto_enabled": false,
-      "idle_seconds": 600
-    },
-    {
-      "id": "pc-104",
-      "address": "10.126.126.104",
-      "port": 22,
-      "credentials_file": "pc104.credentials.txt",
-      "auto_enabled": false,
-      "idle_seconds": 600
-    }
-  ],
+  "hosts": [],
   "mode": "observe"
 }

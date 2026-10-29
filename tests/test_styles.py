@@ -6,15 +6,16 @@ import unittest
 from monitor import handler_for
 
 class Request:
-    def __init__(self, path):
-        self.input=io.BytesIO(f'GET {path} HTTP/1.1\r\nHost: 127.0.0.1:8765\r\nConnection: close\r\n\r\n'.encode())
+    def __init__(self, path, accept_encoding=''):
+        extra = f'Accept-Encoding: {accept_encoding}\r\n' if accept_encoding else ''
+        self.input=io.BytesIO(f'GET {path} HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n{extra}Connection: close\r\n\r\n'.encode())
         self.output=io.BytesIO()
     def makefile(self,*args,**kwargs):return self.input
     def sendall(self,data):self.output.write(data)
 
 class StylesTests(unittest.TestCase):
-    def response(self,path):
-        request=Request(path)
+    def response(self,path,accept_encoding=''):
+        request=Request(path,accept_encoding)
         handler_for(None)(request,('127.0.0.1',10000),SimpleNamespace(server_port=8765))
         raw=request.output.getvalue()
         head,body=raw.split(b'\r\n\r\n',1)
@@ -37,3 +38,21 @@ class StylesTests(unittest.TestCase):
         self.assertEqual(headers['Cache-Control'],'no-store')
         self.assertEqual(body,(Path(__file__).resolve().parents[1]/'web/style.css').read_bytes())
         self.assertIn(b'.sidebar',body)
+
+    def test_large_json_response_uses_gzip_when_advertised(self):
+        import gzip
+        import json
+        request=Request('/api/status', 'gzip, deflate')
+        monitor = SimpleNamespace(snapshot=lambda: {'tasks': ['x' * 5000]})
+        handler_for(monitor)(request,('127.0.0.1',10000),SimpleNamespace(server_port=8765))
+        raw=request.output.getvalue()
+        head,body=raw.split(b'\r\n\r\n',1)
+        self.assertIn(b'Content-Encoding: gzip',head)
+        self.assertLess(len(body),100)
+        self.assertEqual(json.loads(gzip.decompress(body)),monitor.snapshot())
+        for accepted in ('', 'gzip;q=0, deflate', 'x-gzip-unsupported'):
+            request=Request('/api/status',accepted)
+            handler_for(monitor)(request,('127.0.0.1',10000),SimpleNamespace(server_port=8765))
+            head,body=request.output.getvalue().split(b'\r\n\r\n',1)
+            self.assertNotIn(b'Content-Encoding:',head)
+            self.assertEqual(json.loads(body),monitor.snapshot())

@@ -46,23 +46,50 @@ class WorkspaceTests(unittest.TestCase):
         return int(head.split()[1]), json.loads(raw)
 
     def test_owner_has_four_hosts_new_user_has_empty_private_space(self):
-        self.spaces.for_user(self.owner).record('pc-103', 99, 'manual_started')
+        monitor = self.spaces.for_user(self.owner)
+        monitor.record('pc-103', 99, 'manual_started')
+        monitor.archives['pc-103'] = {'recycle': dict(state='ready', checked_at=1,
+                                                    tasks=[dict(id=99, name='private archived task', read_only=True)])}
         _, owner = self.request('owner', 'GET', '/api/status')
         _, guest = self.request('guest', 'GET', '/api/status')
         self.assertEqual(len(owner['hosts']), 4)
         self.assertEqual(len(owner['events']), 1)
+        archived = next(h for h in owner['hosts'] if h['id'] == 'pc-103')['archives']['recycle']['tasks']
+        self.assertEqual(archived[0]['name'], 'private archived task')
         self.assertEqual(guest['hosts'], [])
         self.assertEqual(guest['events'], [])
         self.assertEqual(guest['fleet']['history'], {})
         self.assertEqual(guest['fleet']['total'], 0)
         self.assertNotIn('owner-secret', json.dumps(owner))
         self.assertNotIn('pc-103', json.dumps(guest))
+        self.assertNotIn('private archived task', json.dumps(guest))
+
+    def test_owner_can_edit_and_remove_machine_through_authenticated_routes(self):
+        monitor=self.spaces.for_user(self.owner)
+        host=next(h for h in monitor.config['hosts'] if h['id']=='pc-103')
+        code,result=self.request('owner','POST','/api/hosts/update',dict(host='pc-103',name='工作机',address=host['address'],port=22))
+        self.assertEqual(code,200);self.assertEqual(result['id'],'pc-103')
+        _,status=self.request('owner','GET','/api/status')
+        self.assertEqual(next(h for h in status['hosts'] if h['id']=='pc-103')['name'],'工作机')
+        code,_=self.request('owner','POST','/api/hosts/delete',dict(host='pc-103',confirmation='工作机'))
+        self.assertEqual(code,200)
+        _,status=self.request('owner','GET','/api/status')
+        self.assertEqual(len(status['hosts']),3)
+        _,guest=self.request('guest','GET','/api/status')
+        self.assertEqual(guest['hosts'],[])
 
     def test_user_id_in_request_cannot_select_another_workspace(self):
         for path, body in [('/api/refresh', {'host': 'pc-103'}),
+                           ('/api/hosts/update', {'host':'pc-103','name':'renamed','address':'10.0.0.9','port':22}),
+                           ('/api/hosts/delete', {'host':'pc-103','confirmation':'pc-103'}),
+                           ('/api/hosts/probe', {'host':'pc-103','name':'renamed','address':'10.0.0.9','port':22}),
                            ('/api/settings/credentials', {'host': 'pc-103', 'username': 'x', 'password': 'x'}),
                            ('/api/settings/automation', {'host': 'pc-103', 'enabled': True, 'idle_seconds': 60}),
-                           ('/api/actions/preview', {'host': 'pc-103', 'command': 'del_zero'})]:
+                           ('/api/actions/preview', {'host': 'pc-103', 'command': 'del_zero'}),
+                           ('/api/cloud/preview', {'host': 'pc-103', 'command': 'transfer'}),
+                           ('/api/previews/start', {'kind':'manual','host':'pc-103','command':'start_all'}),
+                           ('/api/previews/status', {'preview':'another-user-ticket'}),
+                           ('/api/cloud/inspect', {'host': 'pc-103', 'action': 'status'})]:
             code, _ = self.request('guest', 'POST', path, dict(body, user_id=self.owner, username='owner'))
             self.assertEqual(code, 400)
         self.assertEqual(self.spaces.for_user(self.guest).config['hosts'], [])
@@ -71,6 +98,22 @@ class WorkspaceTests(unittest.TestCase):
         token = self.auth.session(self.cookies['owner'])[1]['token']
         code, _ = self.request('guest', 'POST', '/api/fleet/accelerate', {}, token=token)
         self.assertEqual(code, 403)
+
+    def test_cloud_previews_and_records_cannot_cross_accounts(self):
+        monitor = self.spaces.for_user(self.owner)
+        task = dict(id=99, name='private-cloud-source', save_path='D:\\test', size=100, received=1,
+                    speed=0, status=5, active=True, task_type=2, url='magnet:?xt=test')
+        monitor.cloud.remote = Mock()
+        monitor.cloud.remote.status.return_value = {'state': {}, 'workers': {}}
+        with patch('cloud_transfer.read_live_tasks', return_value=[task]):
+            code, preview = self.request('owner', 'POST', '/api/cloud/preview', dict(host='pc-103', command='transfer'))
+        self.assertEqual(code, 200)
+        code, _ = self.request('guest', 'POST', '/api/cloud/execute', dict(plan=preview['plan'], user_id=self.owner))
+        self.assertEqual(code, 400)
+        monitor.cloud.host_states['pc-103'] = dict(state='ready', jobs=[dict(name='private-cloud-result')])
+        _, result = self.request('guest', 'GET', '/api/status')
+        self.assertNotIn('private-cloud-result', json.dumps(result))
+        self.assertEqual(result['cloud'], dict(hosts={}, jobs=[]))
 
     def test_plans_jobs_and_probe_tokens_are_private(self):
         monitor = self.spaces.for_user(self.owner)

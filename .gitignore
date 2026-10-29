@@ -12,3 +12,18 @@ backup/
 migration/
 
 /users/
+
+# Local build / editor / browser-test artifacts
+.DS_Store
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+playwright-report/
+test-results/
+*.log
+*.tar
+*.tar.gz
+*.sqlite3
+*.sqlite3-*

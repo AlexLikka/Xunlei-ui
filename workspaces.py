@@ -5,6 +5,7 @@ import threading
 import time
 
 from paths import initialize
+from resource_limits import POLL_WORKERS
 
 
 class Workspaces:
@@ -45,7 +46,7 @@ class Workspaces:
     def run(self):
         pending, due = {}, {}
         offset = 0
-        with ThreadPoolExecutor(max_workers=16, thread_name_prefix='host-poll') as pool:
+        with ThreadPoolExecutor(max_workers=POLL_WORKERS, thread_name_prefix='host-poll') as pool:
             while not self.stop.is_set():
                 pending = {k: v for k, v in pending.items() if not v.done()}
                 with self.lock:
@@ -58,11 +59,14 @@ class Workspaces:
                     with monitor.lock:
                         hosts = list(monitor.config['hosts'])
                     for host in hosts:
+                        # Native cloud jobs have their own status reader. Keep
+                        # progress updating while a full task poll is pending.
+                        monitor.cloud.refresh_async(host['id'])
                         key = (user_id, host['id'])
                         now = time.monotonic()
-                        if self.stop.is_set() or len(pending) >= 64:
+                        if self.stop.is_set() or len(pending) >= POLL_WORKERS:
                             break
-                        if key not in pending and now >= due.get(key, 0):
+                        if key not in pending and now >= due.get(key, 0) and host['id'] not in monitor.actions.busy and not monitor.cloud.is_busy(host['id']):
                             pending[key] = pool.submit(monitor.poll_host, host)
                             due[key] = now + monitor.config['poll_seconds']
                 self.stop.wait(1)
@@ -80,3 +84,5 @@ class Workspaces:
         for monitor in self.monitors.values():
             monitor.fleet.join()
             monitor.actions.join()
+            monitor.cloud.join()
+            monitor.previews.join()

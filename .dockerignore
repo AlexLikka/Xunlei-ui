@@ -12,7 +12,10 @@
 !machine_settings.py
 !manual_actions.py
 !thunder_api.py
+!cloud_transfer.py
 !web/
 !web/**
 !remote/
 !remote/**
+!resource_limits.py
+!previews.py

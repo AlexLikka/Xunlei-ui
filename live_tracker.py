@@ -14,7 +14,9 @@ class LiveTracker:
         previous, current, output = self.previous, {}, []
         for row in rows:
             task_id = row['id']
-            downloading = row.get('active') is True and row.get('status') == 5
+            downloading = (row.get('active') is True and row.get('status') == 5
+                           and not row.get('read_only') and row.get('view', 'incomplete') == 'incomplete'
+                           and not row.get('recycle_time', 0))
             zero = downloading and type(row.get('speed')) is int and row['speed'] == 0
             identity = (row.get('name'), row.get('save_path'))
             prev = previous.get(task_id)
@@ -27,7 +29,10 @@ class LiveTracker:
                      else 'paused' if row.get('status') == 7 else 'other')
             reason = ('连续零速计时中' if zero else '正在传输' if downloading and row.get('speed') is not None
                       else '速度未知，禁止删除' if downloading else '非正在下载，禁止删除')
-            eligible = zero and elapsed >= self.threshold
+            cloud_download = row.get('is_pan_task') is True or row.get('origin') == 'cloud_bridge_v1'
+            eligible = zero and elapsed >= self.threshold and not cloud_download
+            if cloud_download:
+                reason = '云盘下载不参与自动清理'
             current[task_id] = dict(zero=zero, identity=identity, seen=now, since=since, received=row['received'])
             output.append({**row, 'live_state':state, 'estimated_bps':row.get('speed'),
                            'unchanged_seconds':int(elapsed), 'needs_review':eligible,
